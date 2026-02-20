@@ -10,6 +10,38 @@ over time.
    :depth: 2
 
 
+Ensemble mode output | Feb 2026
+------------------------------------
+
+Ensemble mode (passing multiple model directories to ``litpose predict`` or
+``litpose sam-detect infer``) produces the following new files in the output
+directory:
+
+.. code-block::
+
+    <output_dir>/<video_stem>/
+    ├── ensemble_mean.csv          # Averaged predictions (DLC format)
+    ├── ensemble_variance.csv      # Per-keypoint model disagreement
+    ├── provenance.json            # Model dirs, versions, per-model status
+    ├── qc_flags.csv               # Binary tracking error flags (0/1)
+    ├── qc_posteriors.csv          # Continuous anomaly scores [0, 1]
+    ├── qc_summary.csv             # Per-keypoint flagged frame counts
+    ├── model_0/<video_stem>.csv   # Individual model predictions
+    ├── model_1/<video_stem>.csv
+    └── ...
+
+For SAM multi-animal mode, the same files appear under each animal's
+subdirectory with an ``<animal_id>_`` prefix on QC files.
+
+Single-model users are unaffected — no new files are produced when a single
+model directory is passed.
+
+Video format support was expanded to include ``.avi``, ``.mov``, and ``.mkv``
+in addition to the existing ``.mp4`` support.
+
+See :doc:`/source/user_guide_advanced/ensemble_qc` for usage details.
+
+
 v2.0.5.3 | Feb 8, 2026
 ------------------------------------
 

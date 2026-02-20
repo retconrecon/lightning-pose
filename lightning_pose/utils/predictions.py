@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import gc
+import logging
 import os
 import warnings
 from pathlib import Path
@@ -29,6 +30,8 @@ from lightning_pose.models import ALLOWED_MODELS
 if TYPE_CHECKING:
     from lightning_pose.api.model import Model
 
+logger = logging.getLogger(__name__)
+
 # to ignore imports for sphix-autoapidoc
 __all__ = [
     "PredictionHandler",
@@ -39,6 +42,7 @@ __all__ = [
     "load_model_from_checkpoint",
     "create_labeled_video",
     "export_predictions_and_labeled_video",
+    "compute_ensemble_variance",
 ]
 
 
@@ -859,6 +863,136 @@ def generate_labeled_video(
         output_video_path=output_mp4_file,
         colormap=colormap,
     )
+
+
+@typechecked
+def compute_ensemble_variance(
+    pred_csv_paths: list[Path],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute mean predictions and per-keypoint variance across an ensemble.
+
+    Loads N prediction CSVs (same video, different models), stacks them, and
+    computes the mean and variance of x/y coordinates per keypoint per frame.
+    High variance indicates model disagreement on this keypoint's location.
+
+    Args:
+        pred_csv_paths: Paths to N prediction CSVs (same video, different models).
+            All must have the same frame count and keypoint columns.
+
+    Returns:
+        (mean_preds, variance_df):
+            - mean_preds: DataFrame with averaged x/y and mean likelihood,
+              using scorer="ensemble" in the 3-level DLC column header.
+            - variance_df: DataFrame with per-keypoint x_var, y_var, total_var
+              (total_var = x_var + y_var, i.e. trace of the 2x2 coordinate
+              scatter matrix).  Off-diagonal covariance Cov(x, y) is not
+              captured; total_var summarizes marginal disagreement only.
+
+    """
+    if len(pred_csv_paths) < 2:
+        raise ValueError(
+            f"Ensemble requires at least 2 prediction CSVs, got {len(pred_csv_paths)}"
+        )
+
+    # Load all prediction DataFrames
+    dfs = []
+    for path in pred_csv_paths:
+        df = pd.read_csv(path, header=[0, 1, 2], index_col=0)
+        dfs.append(df)
+
+    # Validate consistent shape and columns.
+    # Compare by (bodypart, coord) only — scorer names differ across model
+    # architectures (e.g. "heatmap_tracker" vs "heatmap_mhcrnn_tracker").
+    ref_shape = dfs[0].shape
+    ref_bp_coords = [(c[1], c[2]) for c in dfs[0].columns]
+    for i, df in enumerate(dfs[1:], start=1):
+        if df.shape != ref_shape:
+            raise ValueError(
+                f"CSV shape mismatch: {pred_csv_paths[0].name} has shape {ref_shape} "
+                f"but {pred_csv_paths[i].name} has shape {df.shape}"
+            )
+        bp_coords = [(c[1], c[2]) for c in df.columns]
+        if bp_coords != ref_bp_coords:
+            raise ValueError(
+                f"Column mismatch between {pred_csv_paths[0].name} and "
+                f"{pred_csv_paths[i].name}"
+            )
+
+    # Extract values by coordinate level.  Each DataFrame may have a different
+    # scorer name (e.g. "heatmap_tracker" vs "heatmap_mhcrnn_tracker"), so we
+    # select columns per-DataFrame by the coordinate level, not by full tuple.
+    def _select_by_coord(df: pd.DataFrame, coord: str) -> np.ndarray:
+        mask = [c[2] == coord for c in df.columns]
+        return df.iloc[:, mask].values
+
+    # Stack values: shape (n_models, n_frames, n_keypoints)
+    x_stack = np.stack([_select_by_coord(df, "x") for df in dfs], axis=0)
+    y_stack = np.stack([_select_by_coord(df, "y") for df in dfs], axis=0)
+
+    # Compute mean and variance across models (axis=0).
+    # Use ddof=1 for unbiased sample variance — with typical ensemble sizes
+    # (N=3 to 7), ddof=0 underestimates variance by N/(N-1) (e.g. 25% for N=5).
+    import warnings  # suppress nanvar RuntimeWarning on single-value slices
+
+    x_mean = np.nanmean(x_stack, axis=0)
+    y_mean = np.nanmean(y_stack, axis=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        x_var = np.nanvar(x_stack, axis=0, ddof=1)
+        y_var = np.nanvar(y_stack, axis=0, ddof=1)
+
+    # Mean likelihood
+    has_likelihood = any(c[2] == "likelihood" for c in dfs[0].columns)
+    if has_likelihood:
+        lh_stack = np.stack([_select_by_coord(df, "likelihood") for df in dfs], axis=0)
+        lh_mean = np.nanmean(lh_stack, axis=0)
+    else:
+        lh_mean = np.full_like(x_mean, np.nan)
+
+    # Build bodypart list from x columns of reference DataFrame
+    bodyparts = [c[1] for c in dfs[0].columns if c[2] == "x"]
+
+    # --- mean_preds: standard DLC format with scorer="ensemble" ---
+    mean_cols = []
+    mean_data = []
+    for j, bp in enumerate(bodyparts):
+        mean_cols.append(("ensemble", bp, "x"))
+        mean_cols.append(("ensemble", bp, "y"))
+        mean_cols.append(("ensemble", bp, "likelihood"))
+        mean_data.append(x_mean[:, j])
+        mean_data.append(y_mean[:, j])
+        mean_data.append(lh_mean[:, j])
+
+    mean_preds = pd.DataFrame(
+        np.column_stack(mean_data),
+        index=dfs[0].index,
+        columns=pd.MultiIndex.from_tuples(mean_cols, names=["scorer", "bodyparts", "coords"]),
+    )
+
+    # --- variance_df: per-keypoint variance ---
+    total_var = x_var + y_var
+    var_cols = []
+    var_data = []
+    for j, bp in enumerate(bodyparts):
+        var_cols.append(("ensemble", bp, "x_var"))
+        var_cols.append(("ensemble", bp, "y_var"))
+        var_cols.append(("ensemble", bp, "total_var"))
+        var_data.append(x_var[:, j])
+        var_data.append(y_var[:, j])
+        var_data.append(total_var[:, j])
+
+    variance_df = pd.DataFrame(
+        np.column_stack(var_data),
+        index=dfs[0].index,
+        columns=pd.MultiIndex.from_tuples(var_cols, names=["scorer", "bodyparts", "coords"]),
+    )
+
+    logger.info(
+        f"Ensemble variance computed from {len(pred_csv_paths)} models, "
+        f"{len(bodyparts)} keypoints, {len(dfs[0])} frames"
+    )
+
+    return mean_preds, variance_df
 
 
 def predict_video(

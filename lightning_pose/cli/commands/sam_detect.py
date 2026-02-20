@@ -7,8 +7,11 @@ Provides two subcommands:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from textwrap import dedent
+
+logger = logging.getLogger(__name__)
 
 
 def register_parser(subparsers):
@@ -195,8 +198,9 @@ def register_parser(subparsers):
     infer_input.add_argument(
         "--model_dir",
         type=Path,
+        nargs="+",
         required=True,
-        help="Path to a trained LP model directory.",
+        help="Path(s) to trained LP model dir(s). Pass multiple for ensemble variance.",
     )
 
     infer_output = infer_input.add_argument_group("output")
@@ -226,7 +230,11 @@ def register_parser(subparsers):
         help="Compute temporal norm and PCA error per animal. "
         "Useful for detecting tracking errors. Adds ~10-20s overhead per animal.",
     )
-
+    infer_options.add_argument(
+        "--skip_qc",
+        action="store_true",
+        help="Skip QC flagging after inference.",
+    )
     return sam_parser
 
 
@@ -427,6 +435,8 @@ def _handle_prepare_dataset(args):
 
 def _handle_infer(args):
     """Run multi-animal inference."""
+    import pandas as pd
+
     from lightning_pose.utils.sam import merge_multi_animal_predictions, run_multi_animal_inference
 
     # Resolve all paths to absolute for consistent downstream behavior
@@ -435,8 +445,13 @@ def _handle_infer(args):
     if args.bbox_dir is not None:
         args.bbox_dir = args.bbox_dir.resolve()
     args.video = args.video.resolve()
-    args.model_dir = args.model_dir.resolve()
+    # model_dir is now a list (nargs="+")
+    model_dirs = [d.resolve() for d in args.model_dir]
     args.output_dir = args.output_dir.resolve()
+
+    is_ensemble = len(model_dirs) > 1
+    if is_ensemble:
+        print(f"Ensemble mode: {len(model_dirs)} models")
 
     # Validate crop_ratio
     if hasattr(args, "crop_ratio") and not (0.5 <= args.crop_ratio <= 10.0):
@@ -452,10 +467,13 @@ def _handle_infer(args):
     else:
         raise ValueError("Must provide either --masks_dir or --bbox_dir")
 
+    # Pass single Path for single model, list for ensemble
+    model_dir_arg = model_dirs[0] if len(model_dirs) == 1 else model_dirs
+
     results = run_multi_animal_inference(
         bbox_dfs=bbox_dfs,
         input_video_file=args.video,
-        model_dir=args.model_dir,
+        model_dir=model_dir_arg,
         output_base_dir=args.output_dir,
         compute_metrics=args.compute_metrics,
     )
@@ -465,16 +483,30 @@ def _handle_infer(args):
         print(f"  {animal_id}:")
         if "error" in paths:
             print(f"    FAILED: {paths['error']}")
+        elif is_ensemble:
+            print(f"    ensemble mean: {paths['ensemble_mean_file']}")
+            print(f"    ensemble variance: {paths['ensemble_variance_file']}")
         else:
             print(f"    remapped predictions: {paths['remapped_preds_file']}")
 
+    # --- QC flagging ---
+    if not args.skip_qc:
+        _run_qc_for_animals(results, args, is_ensemble)
+
     if args.merge:
-        # Skip failed animals when merging
-        pred_files = {
-            animal_id: paths["remapped_preds_file"]
-            for animal_id, paths in results.items()
-            if "remapped_preds_file" in paths
-        }
+        if is_ensemble:
+            # In ensemble mode, merge the ensemble mean files
+            pred_files = {
+                animal_id: paths["ensemble_mean_file"]
+                for animal_id, paths in results.items()
+                if "ensemble_mean_file" in paths
+            }
+        else:
+            pred_files = {
+                animal_id: paths["remapped_preds_file"]
+                for animal_id, paths in results.items()
+                if "remapped_preds_file" in paths
+            }
         if not pred_files:
             print("\nERROR: No animals completed successfully. Cannot merge.")
         else:
@@ -484,3 +516,80 @@ def _handle_infer(args):
             merged_file = args.output_dir / "merged_predictions.csv"
             merge_multi_animal_predictions(pred_files, merged_file)
             print(f"\nMerged predictions: {merged_file}")
+
+
+def _run_qc_for_animals(results: dict, args, is_ensemble: bool) -> None:
+    """Run QC flagging for each successfully processed animal."""
+    import pandas as pd
+
+    from lightning_pose.utils.qc import flag_outlier_frames, format_qc_summary, save_qc_report
+
+    has_metrics = args.compute_metrics or is_ensemble
+    if not has_metrics:
+        return
+
+    print("\nQC flagging:")
+    for animal_id, paths in results.items():
+        if "error" in paths:
+            continue
+
+        animal_dir = args.output_dir / animal_id
+
+        # Determine where metric CSVs live
+        if is_ensemble:
+            # Metrics are in model_0/ subdir; ensemble variance is in animal_dir
+            metric_subdir = animal_dir / "model_0"
+        else:
+            metric_subdir = animal_dir
+
+        # Find the cropped video stem for metric CSV filenames
+        cropped_video = paths.get("cropped_video")
+        if cropped_video is None:
+            continue
+        stem = Path(cropped_video).stem
+
+        # Load available metrics
+        temporal_norm_df = None
+        pca_singleview_df = None
+        ensemble_variance_df = None
+
+        if args.compute_metrics:
+            tn_file = metric_subdir / f"{stem}_temporal_norm.csv"
+            if tn_file.exists():
+                temporal_norm_df = pd.read_csv(tn_file, index_col=0)
+
+            pca_file = metric_subdir / f"{stem}_pca_singleview_error.csv"
+            if pca_file.exists():
+                pca_singleview_df = pd.read_csv(pca_file, index_col=0)
+
+        if is_ensemble:
+            # Prefer in-memory DataFrame (avoids NFS race / re-parsing overhead)
+            ensemble_variance_df = paths.get("ensemble_variance_df")
+            if ensemble_variance_df is None:
+                ev_file = paths.get("ensemble_variance_file")
+                if ev_file is not None and Path(ev_file).exists():
+                    ensemble_variance_df = pd.read_csv(ev_file, header=[0, 1, 2], index_col=0)
+
+        if temporal_norm_df is None and pca_singleview_df is None and ensemble_variance_df is None:
+            continue
+
+        try:
+            qc_result = flag_outlier_frames(
+                temporal_norm_df=temporal_norm_df,
+                pca_singleview_df=pca_singleview_df,
+                ensemble_variance_df=ensemble_variance_df,
+            )
+
+            save_qc_report(qc_result, animal_dir, prefix=f"{animal_id}_")
+            print(f"  {animal_id}:")
+            # Indent the QC summary under the animal
+            summary_text = format_qc_summary(qc_result)
+            for line in summary_text.split("\n"):
+                print(f"    {line}")
+        except Exception as e:
+            logger.debug(f"QC failed for {animal_id}", exc_info=True)
+            print(
+                f"  WARNING: {animal_id}: QC failed ({type(e).__name__}: {e}). "
+                f"Predictions were saved successfully. "
+                f"Use --skip_qc to suppress QC, or report this issue."
+            )

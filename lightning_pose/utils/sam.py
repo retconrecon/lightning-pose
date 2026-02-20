@@ -12,6 +12,7 @@ Architecture:
 
 import json
 import logging
+import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -611,25 +612,32 @@ def remap_predictions(
     return output_file
 
 
+
 @typechecked
 def run_multi_animal_inference(
     bbox_dfs: dict[str, pd.DataFrame],
     input_video_file: Path,
-    model_dir: Path,
+    model_dir: Path | list[Path],
     output_base_dir: Path,
     compute_metrics: bool = False,
 ) -> dict[str, dict[str, Path]]:
     """Run LP inference for each detected animal in a video.
 
     For each animal:
-    1. Crop the video using SAM-derived bboxes
+    1. Crop the video using SAM-derived bboxes (once, regardless of model count)
     2. Run LP prediction on the cropped video
     3. Remap predictions to original frame coordinates
+
+    When ``model_dir`` is a list of paths (ensemble mode), each model runs
+    inference on the same cropped video.  Per-animal ensemble mean and variance
+    are computed via :func:`compute_ensemble_variance` and saved alongside the
+    individual model predictions.
 
     Args:
         bbox_dfs: Dict mapping animal_id → per-frame bbox DataFrame.
         input_video_file: Path to the original video file.
-        model_dir: Path to a trained LP model directory.
+        model_dir: Path to a trained LP model directory, or a list of paths
+            for ensemble inference.
         output_base_dir: Base directory for all outputs.
         compute_metrics: If True, compute temporal norm and PCA reprojection
             error per animal. Useful for detecting tracking errors but adds
@@ -639,22 +647,43 @@ def run_multi_animal_inference(
         Dict mapping animal_id → dict with paths to:
             - "cropped_video": cropped video file
             - "bbox_file": bbox CSV
-            - "preds_file": raw predictions on cropped video
-            - "remapped_preds_file": predictions in original coordinates
+            - "preds_file": raw predictions on cropped video (single model)
+            - "remapped_preds_file": predictions in original coordinates (single model)
+            - "ensemble_mean_file": ensemble-averaged predictions (ensemble only)
+            - "ensemble_variance_file": per-keypoint variance (ensemble only)
 
     """
     # Lazy import to avoid circular dependency and heavy loading
+    import gc
+
     import torch
 
     from lightning_pose.api.model import Model
+    from lightning_pose.utils.predictions import compute_ensemble_variance
 
     # Determinism controls — ensure reproducible inference across runs
     torch.manual_seed(0)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    model = Model.from_dir(model_dir)
-    results = {}
+    # Normalise model_dir to a list for uniform handling
+    model_dirs = [model_dir] if isinstance(model_dir, Path) else list(model_dir)
+    if len(model_dirs) == 0:
+        raise ValueError("model_dir must contain at least one path")
+    is_ensemble = len(model_dirs) > 1
+
+    if len(model_dirs) > 20:
+        raise ValueError(
+            f"Ensemble with {len(model_dirs)} models is likely a mistake (max 20). "
+            f"Check that model directories are listed correctly."
+        )
+
+    # Validate model dirs exist (fail fast before processing any animals)
+    for d in model_dirs:
+        if not d.is_dir():
+            raise ValueError(f"Model directory does not exist: {d}")
+
+    results: dict[str, dict[str, Path]] = {}
 
     # Pipeline completion sentinel
     sentinel = output_base_dir / "_RUNNING"
@@ -663,10 +692,11 @@ def run_multi_animal_inference(
 
     # Write provenance metadata
     _write_provenance(output_base_dir, {
-        "model_dir": str(model_dir),
+        "model_dir": [str(d) for d in model_dirs] if is_ensemble else str(model_dirs[0]),
         "video_file": str(input_video_file),
         "num_animals": len(bbox_dfs),
         "animal_ids": list(bbox_dfs.keys()),
+        "ensemble_size": len(model_dirs),
     })
 
     try:
@@ -691,7 +721,7 @@ def run_multi_animal_inference(
                 )
 
             try:
-                # Step 1: Crop video
+                # Step 1: Crop video (once — bbox is the same for every model)
                 crop_result = crop_video_for_animal(
                     animal_id=safe_id,
                     bbox_df=bbox_df,
@@ -699,32 +729,107 @@ def run_multi_animal_inference(
                     output_base_dir=output_base_dir,
                 )
 
-                # Step 2: Run LP prediction on cropped video
                 cropped_video = crop_result["cropped_video"]
                 animal_dir = output_base_dir / safe_id
-                pred_result = model.predict_on_video_file(
-                    video_file=cropped_video,
-                    output_dir=animal_dir,
-                    compute_metrics=compute_metrics,
-                    generate_labeled_video=False,
-                )
-                preds_file = animal_dir / f"{cropped_video.stem}.csv"
 
-                # Step 3: Remap to original coordinates
-                remapped_preds_file = remap_predictions(
-                    preds_file=preds_file,
-                    bbox_file=crop_result["bbox_file"],
-                )
+                # Step 2: Run LP prediction with each model (loaded sequentially
+                # to avoid GPU OOM with large ensembles)
+                remapped_paths: list[Path] = []
+                for model_idx, model_dir in enumerate(model_dirs):
+                    model = None
+                    try:
+                        model = Model.from_dir(model_dir)
+                        if is_ensemble:
+                            pred_subdir = animal_dir / f"model_{model_idx}"
+                            pred_subdir.mkdir(parents=True, exist_ok=True)
+                        else:
+                            pred_subdir = animal_dir
 
-                results[safe_id] = {
-                    **crop_result,
-                    "preds_file": preds_file,
-                    "remapped_preds_file": remapped_preds_file,
-                }
+                        model.predict_on_video_file(
+                            video_file=cropped_video,
+                            output_dir=pred_subdir,
+                            compute_metrics=compute_metrics,
+                            generate_labeled_video=False,
+                        )
+                        preds_file = pred_subdir / f"{cropped_video.stem}.csv"
+
+                        # Step 3: Remap to original coordinates
+                        remapped_preds_file = remap_predictions(
+                            preds_file=preds_file,
+                            bbox_file=crop_result["bbox_file"],
+                        )
+                        remapped_paths.append(remapped_preds_file)
+                    except (MemoryError, OSError):
+                        raise
+                    except Exception as e:
+                        if is_ensemble:
+                            logger.error(
+                                f"Model {model_idx} failed for {safe_id}: {e}"
+                            )
+                            continue
+                        raise
+                    finally:
+                        # Free GPU memory before loading next model
+                        del model
+                        gc.collect()
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+
+                # For single-model, keep the flat structure
+                if not is_ensemble:
+                    preds_file = animal_dir / f"{cropped_video.stem}.csv"
+                    results[safe_id] = {
+                        **crop_result,
+                        "preds_file": preds_file,
+                        "remapped_preds_file": remapped_paths[0],
+                    }
+                else:
+                    # Need at least 2 successful models for ensemble variance
+                    valid_paths = [p for p in remapped_paths if p.exists()]
+                    if len(valid_paths) == 2:
+                        logger.info(
+                            f"Animal {safe_id}: ensemble with 2 models provides "
+                            f"variance estimates but limited statistical power for QC. "
+                            f"Consider 3+ models for robust QC."
+                        )
+                    if len(valid_paths) < 2:
+                        logger.warning(
+                            f"Animal {safe_id}: only {len(valid_paths)} model(s) "
+                            f"succeeded, need >= 2 for ensemble variance"
+                        )
+                        results[safe_id] = {
+                            **crop_result,
+                            "error": f"only {len(valid_paths)} model(s) succeeded",
+                        }
+                        continue
+
+                    # Step 4: Compute ensemble variance across models
+                    mean_preds, variance_df = compute_ensemble_variance(valid_paths)
+
+                    # Atomic write to prevent corruption from crash mid-write
+                    ensemble_mean_file = animal_dir / "ensemble_mean.csv"
+                    ensemble_variance_file = animal_dir / "ensemble_variance.csv"
+                    tmp_mean = animal_dir / ".ensemble_mean.csv.tmp"
+                    tmp_var = animal_dir / ".ensemble_variance.csv.tmp"
+                    mean_preds.to_csv(tmp_mean)
+                    variance_df.to_csv(tmp_var)
+                    os.replace(tmp_mean, ensemble_mean_file)
+                    os.replace(tmp_var, ensemble_variance_file)
+
+                    results[safe_id] = {
+                        **crop_result,
+                        "ensemble_mean_file": ensemble_mean_file,
+                        "ensemble_variance_file": ensemble_variance_file,
+                        "ensemble_variance_df": variance_df,
+                    }
 
                 # Mark per-animal completion
                 (animal_dir / "_COMPLETE").touch()
 
+            except (MemoryError, OSError):
+                raise
             except Exception as e:
                 logger.error(f"Failed to process animal {safe_id}: {e}")
                 results[safe_id] = {"error": str(e)}
@@ -732,6 +837,20 @@ def run_multi_animal_inference(
         any_failures = any("error" in v for v in results.values())
         target = "_PARTIAL" if any_failures else "_COMPLETE"
         sentinel.rename(output_base_dir / target)
+
+        # Update provenance with per-animal completion status
+        _write_provenance(output_base_dir, {
+            "model_dir": [str(d) for d in model_dirs] if is_ensemble else str(model_dirs[0]),
+            "video_file": str(input_video_file),
+            "num_animals": len(bbox_dfs),
+            "animal_ids": list(bbox_dfs.keys()),
+            "ensemble_size": len(model_dirs),
+            "animal_status": {
+                aid: "failed" if "error" in paths else "success"
+                for aid, paths in results.items()
+            },
+            "status": target.strip("_").lower(),
+        })
     except Exception:
         sentinel.rename(output_base_dir / "_FAILED")
         raise

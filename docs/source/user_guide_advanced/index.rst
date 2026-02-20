@@ -15,4 +15,5 @@ For each feature, we point out necessary modifications and useful information re
    multiview_fused
    multi_gpu_training
    cropzoom_pipeline
+   ensemble_qc
    custom_imgaug_pipeline

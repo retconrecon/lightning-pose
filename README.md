@@ -56,6 +56,21 @@ To get started with Lightning Pose, follow the guides on our documentation:
 * [Create your first project](https://lightning-pose.readthedocs.io/en/latest/source/create_first_project.html) using the app
 * or follow the CLI User Guides ([Singleview](https://lightning-pose.readthedocs.io/en/latest/source/user_guide_singleview/index.html), [Multiview](https://lightning-pose.readthedocs.io/en/latest/source/user_guide_multiview/index.html)).
 
+## Ensemble Inference and Quality Control
+
+Train multiple models with different random seeds and run them on the same video to
+automatically detect unreliable keypoints:
+
+```shell
+litpose predict model_0/ model_1/ model_2/ video.mp4 --output_dir results/
+```
+
+This produces averaged predictions (`ensemble_mean.csv`), per-keypoint model disagreement
+(`ensemble_variance.csv`), and automatic QC flags (`qc_flags.csv`) that identify
+suspected tracking errors. See the
+[ensemble QC guide](https://lightning-pose.readthedocs.io/en/latest/source/user_guide_advanced/ensemble_qc.html)
+for details.
+
 ## Community
 
 The Lightning Pose team also actively develops the 
