@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "sam_masks_to_lp_bbox",
+    "lp_keypoints_to_sam_bbox",
     "apply_mask_to_images",
     "crop_frames_for_labeling",
     "prepare_animal_dataset",
@@ -232,6 +233,82 @@ def sam_masks_to_lp_bbox_batch(
         animal_id: sam_masks_to_lp_bbox(masks, image_index, crop_ratio=crop_ratio)
         for animal_id, masks in masks_per_animal.items()
     }
+
+
+@typechecked
+def lp_keypoints_to_sam_bbox(
+    keypoints: np.ndarray,
+    confidence: np.ndarray,
+    padding_ratio: float = 0.25,
+    confidence_threshold: float = 0.3,
+    min_confident_keypoints: int = 2,
+) -> list[int] | None:
+    """Convert LP keypoints to a SAM/SAMURAI-compatible [x1, y1, x2, y2] bbox.
+
+    Filters keypoints by confidence, computes a tight bounding box around the
+    confident keypoints, then pads by padding_ratio.
+
+    This is the reverse direction of sam_masks_to_lp_bbox (which goes mask -> bbox).
+
+    Bbox format reference::
+
+        This function returns:    [x1, y1, x2, y2]  — corner coordinates
+        predict_frame expects:    (x, y, w, h)       — top-left + size
+        LP DataFrame columns:    [x, y, h, w]        — top-left + size (h before w)
+
+    To convert this output to predict_frame input::
+
+        result = lp_keypoints_to_sam_bbox(kp, conf)
+        if result is not None:
+            x1, y1, x2, y2 = result
+            bbox = (x1, y1, x2 - x1, y2 - y1)  # (x, y, w, h)
+
+    Args:
+        keypoints: (num_kp, 2) array of (x, y) coordinates in original frame space.
+            NaN keypoints are filtered out before confidence thresholding.
+        confidence: (num_kp,) array of per-keypoint confidence scores.
+            Heatmap peak intensity (not a calibrated probability). The default
+            threshold of 0.3 is a heuristic — optimal values depend on model
+            and dataset.
+        padding_ratio: Fraction of bbox size to add as padding on each side.
+            0.25 means 25% padding, so the bbox is 1.5x the tight fit.
+            Must be >= 0.
+        confidence_threshold: Minimum confidence for a keypoint to be included.
+        min_confident_keypoints: Minimum number of confident keypoints required
+            to produce a bbox. Returns None if fewer pass the threshold.
+
+    Returns:
+        [x1, y1, x2, y2] integer bbox, or None if too few confident keypoints.
+        Note: padding near frame edges can produce negative x1/y1 values.
+        Consumers (SAM/SAMURAI) may need to clamp to frame boundaries.
+
+    """
+    if padding_ratio < 0:
+        raise ValueError(f"padding_ratio must be >= 0, got {padding_ratio}")
+
+    # Filter NaN keypoints before confidence check (AXIOM-5).
+    # NaN coordinates would pass confidence filter and crash int().
+    finite_mask = np.isfinite(keypoints).all(axis=1)
+    conf_mask = confidence >= confidence_threshold
+    mask = finite_mask & conf_mask
+    if mask.sum() < min_confident_keypoints:
+        return None
+
+    kp = keypoints[mask]  # (M, 2)
+    x_min, y_min = kp.min(axis=0)
+    x_max, y_max = kp.max(axis=0)
+
+    w = x_max - x_min
+    h = y_max - y_min
+    pad_x = w * padding_ratio
+    pad_y = h * padding_ratio
+
+    x1 = int(x_min - pad_x)
+    y1 = int(y_min - pad_y)
+    x2 = int(x_max + pad_x)
+    y2 = int(y_max + pad_y)
+
+    return [x1, y1, x2, y2]
 
 
 # ---------------------------------------------------------------------------

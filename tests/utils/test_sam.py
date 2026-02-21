@@ -10,6 +10,7 @@ from lightning_pose.utils.sam import (
     _sanitize_animal_id,
     _validate_bbox_df,
     apply_mask_to_images,
+    lp_keypoints_to_sam_bbox,
     merge_multi_animal_predictions,
     prepare_animal_dataset,
     sam_masks_to_lp_bbox,
@@ -556,3 +557,164 @@ class TestSummarizeDistances:
         all_rows = result[result["keypoint"] == "_ALL_"]
         assert len(all_rows) == 1
         assert all_rows.iloc[0]["mean"] == pytest.approx(1.5)
+
+
+# ---------------------------------------------------------------------------
+# Tests: lp_keypoints_to_sam_bbox
+# ---------------------------------------------------------------------------
+
+
+class TestLpKeypointsToSamBbox:
+
+    def test_basic_bbox(self):
+        """High-confidence keypoints produce a padded bbox."""
+        keypoints = np.array([
+            [100.0, 200.0],
+            [120.0, 220.0],
+            [140.0, 240.0],
+            [160.0, 260.0],
+        ])
+        confidence = np.array([0.9, 0.8, 0.7, 0.6])
+        result = lp_keypoints_to_sam_bbox(keypoints, confidence, padding_ratio=0.25)
+
+        assert result is not None
+        assert len(result) == 4
+        x1, y1, x2, y2 = result
+        # Tight box: x=[100,160], y=[200,260], w=60, h=60
+        # Padding: pad_x=15, pad_y=15
+        assert x1 == int(100.0 - 15.0)  # 85
+        assert y1 == int(200.0 - 15.0)  # 185
+        assert x2 == int(160.0 + 15.0)  # 175
+        assert y2 == int(260.0 + 15.0)  # 275
+
+    def test_confidence_filtering(self):
+        """Only keypoints above threshold should be used."""
+        keypoints = np.array([
+            [10.0, 10.0],    # low confidence — should be excluded
+            [100.0, 100.0],  # high confidence
+            [200.0, 200.0],  # high confidence
+        ])
+        confidence = np.array([0.1, 0.9, 0.8])
+        result = lp_keypoints_to_sam_bbox(
+            keypoints, confidence, padding_ratio=0.0, confidence_threshold=0.5,
+        )
+
+        assert result is not None
+        x1, y1, x2, y2 = result
+        # Only [100,100] and [200,200] used — tight box is x=[100,200], y=[100,200]
+        assert x1 == 100
+        assert y1 == 100
+        assert x2 == 200
+        assert y2 == 200
+
+    def test_returns_none_when_too_few_confident(self):
+        """Returns None if fewer than min_confident_keypoints pass threshold."""
+        keypoints = np.array([
+            [100.0, 200.0],
+            [120.0, 220.0],
+        ])
+        confidence = np.array([0.1, 0.2])  # both below default 0.3 threshold
+        result = lp_keypoints_to_sam_bbox(keypoints, confidence)
+
+        assert result is None
+
+    def test_returns_none_with_one_confident(self):
+        """Only 1 keypoint confident, need at least 2."""
+        keypoints = np.array([
+            [100.0, 200.0],
+            [120.0, 220.0],
+        ])
+        confidence = np.array([0.9, 0.1])
+        result = lp_keypoints_to_sam_bbox(
+            keypoints, confidence, min_confident_keypoints=2,
+        )
+
+        assert result is None
+
+    def test_padding_scales_with_bbox_size(self):
+        """Larger keypoint spread should produce larger padding."""
+        kp_small = np.array([[100.0, 100.0], [110.0, 110.0]])
+        kp_large = np.array([[100.0, 100.0], [200.0, 200.0]])
+        conf = np.array([0.9, 0.9])
+
+        result_small = lp_keypoints_to_sam_bbox(kp_small, conf, padding_ratio=0.25)
+        result_large = lp_keypoints_to_sam_bbox(kp_large, conf, padding_ratio=0.25)
+
+        # Large bbox should have bigger absolute padding
+        small_w = result_small[2] - result_small[0]
+        large_w = result_large[2] - result_large[0]
+        assert large_w > small_w
+
+    def test_zero_padding(self):
+        """padding_ratio=0 should produce a tight bbox."""
+        keypoints = np.array([[50.0, 60.0], [150.0, 160.0]])
+        confidence = np.array([0.9, 0.9])
+        result = lp_keypoints_to_sam_bbox(keypoints, confidence, padding_ratio=0.0)
+
+        assert result == [50, 60, 150, 160]
+
+    def test_returns_integers(self):
+        """All bbox coordinates should be integers."""
+        keypoints = np.array([[10.3, 20.7], [30.9, 40.1]])
+        confidence = np.array([0.9, 0.9])
+        result = lp_keypoints_to_sam_bbox(keypoints, confidence, padding_ratio=0.1)
+
+        assert result is not None
+        for val in result:
+            assert isinstance(val, int)
+
+    def test_single_keypoint_exact_threshold(self):
+        """Keypoint exactly at confidence_threshold should be included."""
+        keypoints = np.array([[100.0, 200.0], [150.0, 250.0]])
+        confidence = np.array([0.3, 0.3])  # exactly at threshold
+        result = lp_keypoints_to_sam_bbox(
+            keypoints, confidence, confidence_threshold=0.3, padding_ratio=0.0,
+        )
+
+        assert result is not None
+        assert result == [100, 200, 150, 250]
+
+    def test_nan_keypoints_filtered(self):
+        """NaN keypoints should be filtered out, not crash int()."""
+        keypoints = np.array([
+            [np.nan, np.nan],   # NaN — should be excluded
+            [100.0, 200.0],     # valid, high confidence
+            [150.0, 250.0],     # valid, high confidence
+        ])
+        confidence = np.array([0.9, 0.8, 0.7])
+        result = lp_keypoints_to_sam_bbox(
+            keypoints, confidence, padding_ratio=0.0,
+        )
+        # Only 2nd and 3rd keypoints used
+        assert result is not None
+        assert result == [100, 200, 150, 250]
+
+    def test_all_nan_keypoints_returns_none(self):
+        """All NaN keypoints should return None (too few confident)."""
+        keypoints = np.array([
+            [np.nan, np.nan],
+            [np.nan, np.nan],
+        ])
+        confidence = np.array([0.9, 0.8])
+        result = lp_keypoints_to_sam_bbox(keypoints, confidence)
+        assert result is None
+
+    def test_nan_reduces_confident_count(self):
+        """NaN keypoints should not count toward min_confident_keypoints."""
+        keypoints = np.array([
+            [np.nan, np.nan],  # NaN — excluded even with high confidence
+            [100.0, 200.0],    # valid, high confidence
+        ])
+        confidence = np.array([0.9, 0.8])
+        # Only 1 valid+confident keypoint, need 2
+        result = lp_keypoints_to_sam_bbox(
+            keypoints, confidence, min_confident_keypoints=2,
+        )
+        assert result is None
+
+    def test_negative_padding_ratio_raises(self):
+        """Negative padding_ratio should raise ValueError."""
+        keypoints = np.array([[100.0, 200.0], [150.0, 250.0]])
+        confidence = np.array([0.9, 0.9])
+        with pytest.raises(ValueError, match="padding_ratio must be >= 0"):
+            lp_keypoints_to_sam_bbox(keypoints, confidence, padding_ratio=-0.1)

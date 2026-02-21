@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from omegaconf import DictConfig, OmegaConf
 
@@ -23,7 +24,7 @@ from lightning_pose.utils.scripts import (
     get_imgaug_transform,
 )
 
-__all__ = ["Model"]
+__all__ = ["Model", "EnsemblePredictor"]
 
 
 class Model:
@@ -115,6 +116,150 @@ class Model:
             / csv_file_path.name
             / ("cropped_" + csv_file_path.name)
         )
+
+    def predict_frame(
+        self,
+        frame_rgb: np.ndarray,
+        bbox: tuple[int, int, int, int] | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Single-frame inference. No file I/O, no DALI.
+
+        Preprocessing uses cv2 (not DALI), which may produce ~1-2px keypoint
+        divergence from ``predict_on_video_file``. This is within model error
+        budget for typical pose estimation models. See PANINSKI-1.
+
+        For MHCRNN (context) models, the single frame is replicated to fill
+        the 5-frame temporal window. The sf/mf confidence merge mitigates the
+        degenerate zero-motion context — if the mf head is uncertain, the sf
+        prediction is kept.
+
+        Bbox format reference::
+
+            predict_frame:          (x, y, w, h)     — top-left + size
+            LP DataFrame columns:   [x, y, h, w]     — top-left + size (h before w)
+            lp_keypoints_to_sam_bbox: [x1, y1, x2, y2] — corner coordinates
+
+        Args:
+            frame_rgb: (H, W, 3) uint8 RGB array in original frame coordinates.
+            bbox: Optional (x, y, w, h) crop region. If provided, crops first,
+                then remaps keypoints back to original coordinates. Note: this
+                is ``(x, y, width, height)``, not LP's DataFrame column order
+                ``[x, y, h, w]``.
+
+        Returns:
+            {"keypoints": (num_kp, 2) float32 array (x, y) in original frame coords,
+             "confidence": (num_kp,) float32 — heatmap peak intensity per keypoint,
+              not a calibrated probability}
+
+        Raises:
+            ValueError: If frame_rgb has wrong shape/dtype, bbox has non-positive
+                dimensions, or bbox produces an empty crop.
+
+        """
+        import cv2
+        import torch
+        from lightning_pose.data import _IMAGENET_MEAN, _IMAGENET_STD
+        from lightning_pose.models.heatmap_tracker_mhcrnn import HeatmapTrackerMHCRNN
+
+        self._load()
+
+        # --- Input validation ---
+        if frame_rgb.ndim != 3 or frame_rgb.shape[2] != 3:
+            raise ValueError(
+                f"frame_rgb must be (H, W, 3), got shape {frame_rgb.shape}"
+            )
+        if frame_rgb.size == 0:
+            raise ValueError("frame_rgb is empty")
+
+        # --- Preprocessing ---
+        if bbox is not None:
+            bx, by, bw, bh = bbox
+            if bw <= 0 or bh <= 0:
+                raise ValueError(
+                    f"bbox width and height must be positive, got w={bw}, h={bh}"
+                )
+            crop = frame_rgb[by:by + bh, bx:bx + bw]
+            if crop.size == 0:
+                raise ValueError(
+                    f"bbox (x={bx}, y={by}, w={bw}, h={bh}) produces an empty "
+                    f"crop on frame of shape {frame_rgb.shape[:2]}"
+                )
+            # Use actual crop dims for remap — numpy clips silently when
+            # bbox extends beyond frame boundaries (AXIOM-3).
+            actual_h, actual_w = crop.shape[:2]
+        else:
+            crop = frame_rgb
+
+        resize_h = self.cfg.data.image_resize_dims.height
+        resize_w = self.cfg.data.image_resize_dims.width
+        resized = cv2.resize(crop, (resize_w, resize_h), interpolation=cv2.INTER_LINEAR)
+
+        # Normalize: /255, subtract mean, divide std (ImageNet)
+        tensor = resized.astype(np.float32) / 255.0
+        mean = np.array(_IMAGENET_MEAN, dtype=np.float32)
+        std = np.array(_IMAGENET_STD, dtype=np.float32)
+        tensor = (tensor - mean) / std
+
+        # HWC -> CHW, add batch dim
+        tensor = np.transpose(tensor, (2, 0, 1))  # (3, H, W)
+
+        device = next(self.model.parameters()).device
+        is_context = isinstance(self.model, HeatmapTrackerMHCRNN)
+
+        # Ensure eval mode (batch norm stats should not drift)
+        self.model.eval()
+
+        if is_context:
+            # MHCRNN expects (seq_len, 3, H, W) — replicate frame to 5-frame sequence.
+            # get_representations handles context extraction internally: it pads,
+            # tiles 5-frame windows, and discards first/last 2, yielding 1 output.
+            # Note: single-frame replication is a degenerate case (zero temporal
+            # signal). The sf/mf confidence merge mitigates this — if the mf head
+            # is uncertain, the sf prediction is kept. See PANINSKI-9.
+            tensor_t = torch.from_numpy(tensor).unsqueeze(0).expand(5, -1, -1, -1)
+            tensor_t = tensor_t.to(device)
+        else:
+            tensor_t = torch.from_numpy(tensor).unsqueeze(0).to(device)  # (1, 3, H, W)
+
+        # --- Inference ---
+        # Use self.model() (not .forward()) to dispatch through PyTorch hooks.
+        with torch.inference_mode():
+            if is_context:
+                heatmaps_sf, heatmaps_mf = self.model(tensor_t)
+                kp_sf, conf_sf = self.model.head.run_subpixelmaxima(heatmaps_sf)
+                kp_mf, conf_mf = self.model.head.run_subpixelmaxima(heatmaps_mf)
+                # Select higher-confidence predictions per keypoint
+                kp_sf = kp_sf.reshape(kp_sf.shape[0], -1, 2)
+                kp_mf = kp_mf.reshape(kp_mf.shape[0], -1, 2)
+                mf_better = torch.gt(conf_mf, conf_sf)
+                kp_sf[mf_better] = kp_mf[mf_better]
+                keypoints = kp_sf.reshape(kp_sf.shape[0], -1)
+                confidence = conf_sf.clone()
+                confidence[mf_better] = conf_mf[mf_better]
+            else:
+                heatmaps = self.model(tensor_t)
+                keypoints, confidence = self.model.head.run_subpixelmaxima(heatmaps)
+
+        # --- Coordinate remap ---
+        # keypoints shape: (1, num_kp * 2) flattened [x1, y1, x2, y2, ...]
+        kp = keypoints[0].cpu().numpy().reshape(-1, 2).astype(np.float32)
+        conf = confidence[0].cpu().numpy().astype(np.float32)
+
+        # Normalize to [0, 1] (replicates convert_bbox_coords division by image dims)
+        kp[:, 0] /= resize_w
+        kp[:, 1] /= resize_h
+
+        # Scale to crop/frame dimensions (replicates normalized_to_bbox).
+        # When bbox is provided, use actual_w/actual_h (not requested bw/bh)
+        # because numpy clips silently when bbox extends beyond frame edges.
+        if bbox is not None:
+            kp[:, 0] = kp[:, 0] * actual_w + bx
+            kp[:, 1] = kp[:, 1] * actual_h + by
+        else:
+            kp[:, 0] *= frame_rgb.shape[1]  # width
+            kp[:, 1] *= frame_rgb.shape[0]  # height
+
+        return {"keypoints": kp, "confidence": conf}
 
     def predict_on_label_csv(
         self,
@@ -442,6 +587,63 @@ class Model:
         df_dict = {view_name: df for view_name, df in zip(view_names, df_list)}
 
         return MultiviewPredictionResult(predictions=df_dict, metrics=metrics)
+
+
+class EnsemblePredictor:
+    """Hold N loaded models for fast repeated single-frame inference.
+
+    Models are loaded once at construction. Call predict_frame() repeatedly
+    without model load/unload overhead.
+
+    Args:
+        model_dirs: List of paths to trained LP model directories.
+    """
+
+    def __init__(self, model_dirs: list[str | Path]):
+        if len(model_dirs) == 0:
+            raise ValueError("model_dirs must contain at least one path")
+        self.models: list[Model] = []
+        try:
+            for d in model_dirs:
+                m = Model.from_dir(d)
+                m._load()  # eager load — all models on GPU
+                self.models.append(m)
+        except Exception:
+            # Clean up any models already loaded on GPU
+            self.models.clear()
+            raise
+
+    def predict_frame(
+        self,
+        frame_rgb: np.ndarray,
+        bbox: tuple[int, int, int, int] | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Run all models on a single frame.
+
+        Returns:
+            {
+                "keypoints": (num_kp, 2) mean keypoints across models,
+                "confidence": (num_kp,) mean of per-model heatmap peak
+                    confidences (not a calibrated ensemble probability),
+                "variance": (num_kp,) per-keypoint total variance
+                    ``var(x) + var(y)``, using population variance (ddof=0).
+                    Units are px^2 in original frame coordinates.
+                    Note: ``compute_ensemble_variance`` in the file-based
+                    pipeline uses ddof=1 (sample variance).
+                "per_model": list of per-model result dicts,
+            }
+        """
+        results = [m.predict_frame(frame_rgb, bbox=bbox) for m in self.models]
+
+        all_kps = np.stack([r["keypoints"] for r in results])    # (N, K, 2)
+        all_conf = np.stack([r["confidence"] for r in results])  # (N, K)
+
+        return {
+            "keypoints": all_kps.mean(axis=0),                   # (K, 2)
+            "confidence": all_conf.mean(axis=0),                  # (K,)
+            "variance": all_kps.var(axis=0).sum(axis=-1),         # (K,)
+            "per_model": results,
+        }
 
 
 def _build_datamodule_pred(cfg: DictConfig):
