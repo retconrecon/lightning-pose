@@ -591,16 +591,12 @@ def load_model_from_checkpoint(
     )
 
     # initialize a model instance, load weights from .ckpt file (fix state_dict keys if needed)
-    try:
-        checkpoint = torch.load(ckpt_file)
-    except Exception as e:
-        print(f"Warning: Failed to load checkpoint with default settings: {e}")
-        print("Attempting to load with weights_only=False...")
-        checkpoint = torch.load(ckpt_file, weights_only=False)
+    checkpoint = torch.load(ckpt_file, weights_only=False)
     state_dict = checkpoint.get("state_dict", checkpoint)
 
     # fix state dict key mismatch for upsampling layers
     # old checkpoints may have 'upsampling_layers' without 'head.' prefix
+    fixed_ckpt_file = ckpt_file
     keys_remapped = False
     for key in list(state_dict.keys()):
         if key.startswith("upsampling_layers."):
@@ -617,27 +613,30 @@ def load_model_from_checkpoint(
         with tempfile.NamedTemporaryFile(suffix='.ckpt', delete=False) as tmp_file:
             torch.save(checkpoint, tmp_file.name)
             fixed_ckpt_file = tmp_file.name
-    else:
-        fixed_ckpt_file = ckpt_file
 
-    if semi_supervised:
-        model = ModelClass.load_from_checkpoint(
-            fixed_ckpt_file,
-            loss_factory=loss_factories["supervised"],
-            loss_factory_unsupervised=loss_factories["unsupervised"],
-            strict=False,
-        )
-    else:
-        model = ModelClass.load_from_checkpoint(
-            fixed_ckpt_file,
-            loss_factory=loss_factories["supervised"],
-            strict=False,
-        )
-
-    # clean up temporary file if created
-    if keys_remapped:
-        import os
-        os.unlink(fixed_ckpt_file)
+    try:
+        if semi_supervised:
+            model = ModelClass.load_from_checkpoint(
+                fixed_ckpt_file,
+                loss_factory=loss_factories["supervised"],
+                loss_factory_unsupervised=loss_factories["unsupervised"],
+                strict=False,
+                weights_only=False,
+            )
+        else:
+            model = ModelClass.load_from_checkpoint(
+                fixed_ckpt_file,
+                loss_factory=loss_factories["supervised"],
+                strict=False,
+                weights_only=False,
+            )
+    finally:
+        # clean up temporary file if created
+        if keys_remapped and fixed_ckpt_file != ckpt_file:
+            try:
+                os.unlink(fixed_ckpt_file)
+            except OSError:
+                pass
 
     if eval:
         model.eval()

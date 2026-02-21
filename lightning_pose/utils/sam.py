@@ -822,7 +822,6 @@ def run_multi_animal_inference(
                         **crop_result,
                         "ensemble_mean_file": ensemble_mean_file,
                         "ensemble_variance_file": ensemble_variance_file,
-                        "ensemble_variance_df": variance_df,
                     }
 
                 # Mark per-animal completion

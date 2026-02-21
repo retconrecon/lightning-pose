@@ -563,12 +563,9 @@ def _run_qc_for_animals(results: dict, args, is_ensemble: bool) -> None:
                 pca_singleview_df = pd.read_csv(pca_file, index_col=0)
 
         if is_ensemble:
-            # Prefer in-memory DataFrame (avoids NFS race / re-parsing overhead)
-            ensemble_variance_df = paths.get("ensemble_variance_df")
-            if ensemble_variance_df is None:
-                ev_file = paths.get("ensemble_variance_file")
-                if ev_file is not None and Path(ev_file).exists():
-                    ensemble_variance_df = pd.read_csv(ev_file, header=[0, 1, 2], index_col=0)
+            ev_file = paths.get("ensemble_variance_file")
+            if ev_file is not None and Path(ev_file).exists():
+                ensemble_variance_df = pd.read_csv(ev_file, header=[0, 1, 2], index_col=0)
 
         if temporal_norm_df is None and pca_singleview_df is None and ensemble_variance_df is None:
             continue

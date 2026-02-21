@@ -43,7 +43,7 @@ def build_backbone(
                 "in order to access 'resnet50_contrastive' backbone"
             )
         ckpt_url = "https://pl-bolts-weights.s3.us-east-2.amazonaws.com/simclr/bolts_simclr_imagenet/simclr_imagenet.ckpt"  # noqa: E501
-        simclr = SimCLR.load_from_checkpoint(ckpt_url, strict=False)
+        simclr = SimCLR.load_from_checkpoint(ckpt_url, strict=False, weights_only=False)
         base = simclr.encoder
 
     elif "resnet50_animal" in backbone_arch:
