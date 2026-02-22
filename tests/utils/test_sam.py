@@ -12,9 +12,11 @@ from lightning_pose.utils.sam import (
     apply_mask_to_images,
     lp_keypoints_to_sam_bbox,
     merge_multi_animal_predictions,
+    normalize_variance,
     prepare_animal_dataset,
     sam_masks_to_lp_bbox,
     sam_masks_to_lp_bbox_batch,
+    smooth_bbox,
 )
 # sam_eval lives in scripts/ as a standalone tool (no LP imports)
 import sys
@@ -718,3 +720,311 @@ class TestLpKeypointsToSamBbox:
         confidence = np.array([0.9, 0.9])
         with pytest.raises(ValueError, match="padding_ratio must be >= 0"):
             lp_keypoints_to_sam_bbox(keypoints, confidence, padding_ratio=-0.1)
+
+    # -- frame_dims clamping --
+
+    def test_frame_dims_clamps_negative_coords(self):
+        """frame_dims should clamp negative x1/y1 to 0."""
+        keypoints = np.array([[5.0, 5.0], [15.0, 15.0]])
+        confidence = np.array([0.9, 0.9])
+        result = lp_keypoints_to_sam_bbox(
+            keypoints, confidence, padding_ratio=0.5,
+            frame_dims=(640, 480),
+        )
+        assert result is not None
+        x1, y1, x2, y2 = result
+        assert x1 >= 0
+        assert y1 >= 0
+
+    def test_frame_dims_clamps_overflow(self):
+        """frame_dims should clamp x2/y2 to frame width/height."""
+        keypoints = np.array([[630.0, 470.0], [638.0, 478.0]])
+        confidence = np.array([0.9, 0.9])
+        result = lp_keypoints_to_sam_bbox(
+            keypoints, confidence, padding_ratio=0.5,
+            frame_dims=(640, 480),
+        )
+        assert result is not None
+        x1, y1, x2, y2 = result
+        assert x2 <= 640
+        assert y2 <= 480
+
+    def test_frame_dims_none_allows_negative(self):
+        """Without frame_dims, negative coords are allowed (backward compat)."""
+        keypoints = np.array([[2.0, 2.0], [8.0, 8.0]])
+        confidence = np.array([0.9, 0.9])
+        result = lp_keypoints_to_sam_bbox(
+            keypoints, confidence, padding_ratio=1.0,
+        )
+        assert result is not None
+        x1, y1, _, _ = result
+        assert x1 < 0 or y1 < 0
+
+    def test_frame_dims_both_axes_clamped(self):
+        """Both negative and overflow clamping applied simultaneously."""
+        keypoints = np.array([[0.0, 0.0], [100.0, 100.0]])
+        confidence = np.array([0.9, 0.9])
+        result = lp_keypoints_to_sam_bbox(
+            keypoints, confidence, padding_ratio=0.5,
+            frame_dims=(80, 80),
+        )
+        assert result is not None
+        x1, y1, x2, y2 = result
+        assert x1 == 0
+        assert y1 == 0
+        assert x2 == 80
+        assert y2 == 80
+
+    # -- min_bbox_size --
+
+    def test_min_bbox_size_expands_small_bbox(self):
+        """Tiny bbox should be expanded to min_bbox_size."""
+        keypoints = np.array([[100.0, 100.0], [102.0, 102.0]])
+        confidence = np.array([0.9, 0.9])
+        result = lp_keypoints_to_sam_bbox(
+            keypoints, confidence, padding_ratio=0.0,
+            min_bbox_size=32,
+        )
+        assert result is not None
+        x1, y1, x2, y2 = result
+        assert (x2 - x1) >= 32
+        assert (y2 - y1) >= 32
+
+    def test_min_bbox_size_no_effect_on_large_bbox(self):
+        """min_bbox_size should not shrink an already-large bbox."""
+        keypoints = np.array([[50.0, 50.0], [150.0, 150.0]])
+        confidence = np.array([0.9, 0.9])
+        result_no_min = lp_keypoints_to_sam_bbox(
+            keypoints, confidence, padding_ratio=0.0, min_bbox_size=0,
+        )
+        result_with_min = lp_keypoints_to_sam_bbox(
+            keypoints, confidence, padding_ratio=0.0, min_bbox_size=32,
+        )
+        assert result_no_min == result_with_min
+
+    def test_min_bbox_size_symmetric_expansion(self):
+        """Expansion should be symmetric around the center."""
+        keypoints = np.array([[100.0, 200.0], [100.0, 200.0]])
+        confidence = np.array([0.9, 0.9])
+        result = lp_keypoints_to_sam_bbox(
+            keypoints, confidence, padding_ratio=0.0,
+            min_bbox_size=40,
+        )
+        assert result is not None
+        x1, y1, x2, y2 = result
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        assert cx == pytest.approx(100.0, abs=1)
+        assert cy == pytest.approx(200.0, abs=1)
+        assert (x2 - x1) >= 40
+        assert (y2 - y1) >= 40
+
+    def test_min_bbox_size_with_frame_dims_clamping(self):
+        """min_bbox_size expansion then frame_dims clamping."""
+        keypoints = np.array([[5.0, 5.0], [5.0, 5.0]])
+        confidence = np.array([0.9, 0.9])
+        result = lp_keypoints_to_sam_bbox(
+            keypoints, confidence, padding_ratio=0.0,
+            min_bbox_size=32, frame_dims=(640, 480),
+        )
+        assert result is not None
+        x1, y1, x2, y2 = result
+        assert x1 >= 0
+        assert y1 >= 0
+        assert (x2 - x1) > 0
+        assert (y2 - y1) > 0
+
+    def test_negative_min_bbox_size_raises(self):
+        """Negative min_bbox_size should raise ValueError."""
+        keypoints = np.array([[100.0, 200.0], [150.0, 250.0]])
+        confidence = np.array([0.9, 0.9])
+        with pytest.raises(ValueError, match="min_bbox_size must be >= 0"):
+            lp_keypoints_to_sam_bbox(
+                keypoints, confidence, min_bbox_size=-1,
+            )
+
+    # -- P1 input validation --
+
+    def test_keypoints_wrong_ndim_raises(self):
+        """1D keypoints array should raise ValueError."""
+        keypoints = np.array([100.0, 200.0])
+        confidence = np.array([0.9])
+        with pytest.raises(ValueError, match="keypoints must be"):
+            lp_keypoints_to_sam_bbox(keypoints, confidence)
+
+    def test_keypoints_wrong_columns_raises(self):
+        """(N, 3) keypoints should raise ValueError."""
+        keypoints = np.array([[100.0, 200.0, 300.0], [110.0, 210.0, 310.0]])
+        confidence = np.array([0.9, 0.9])
+        with pytest.raises(ValueError, match="keypoints must be"):
+            lp_keypoints_to_sam_bbox(keypoints, confidence)
+
+    def test_confidence_length_mismatch_raises(self):
+        """Confidence with different length than keypoints should raise."""
+        keypoints = np.array([[100.0, 200.0], [110.0, 210.0]])
+        confidence = np.array([0.9, 0.8, 0.7])
+        with pytest.raises(ValueError, match="confidence must be 1D"):
+            lp_keypoints_to_sam_bbox(keypoints, confidence)
+
+    def test_frame_dims_zero_width_raises(self):
+        """frame_dims with zero width should raise ValueError."""
+        keypoints = np.array([[100.0, 200.0], [150.0, 250.0]])
+        confidence = np.array([0.9, 0.9])
+        with pytest.raises(ValueError, match="frame_dims must be positive"):
+            lp_keypoints_to_sam_bbox(
+                keypoints, confidence, frame_dims=(0, 480),
+            )
+
+    def test_frame_dims_negative_raises(self):
+        """frame_dims with negative value should raise ValueError."""
+        keypoints = np.array([[100.0, 200.0], [150.0, 250.0]])
+        confidence = np.array([0.9, 0.9])
+        with pytest.raises(ValueError, match="frame_dims must be positive"):
+            lp_keypoints_to_sam_bbox(
+                keypoints, confidence, frame_dims=(-1, 480),
+            )
+
+
+# ---------------------------------------------------------------------------
+# Tests: smooth_bbox
+# ---------------------------------------------------------------------------
+
+
+class TestSmoothBbox:
+
+    def test_alpha_one_returns_current(self):
+        """alpha=1.0 means no smoothing -- return current as-is."""
+        current = [10, 20, 110, 120]
+        previous = [0, 0, 100, 100]
+        result = smooth_bbox(current, previous, alpha=1.0)
+        assert result == current
+
+    def test_alpha_half_averages(self):
+        """alpha=0.5 should average current and previous."""
+        current = [10, 20, 30, 40]
+        previous = [20, 30, 40, 50]
+        result = smooth_bbox(current, previous, alpha=0.5)
+        assert result == [15, 25, 35, 45]
+
+    def test_smoothing_reduces_jitter(self):
+        """Smoothed bbox should be between current and previous."""
+        current = [100, 100, 200, 200]
+        previous = [80, 80, 180, 180]
+        result = smooth_bbox(current, previous, alpha=0.7)
+        for c, p, s in zip(current, previous, result):
+            assert min(c, p) <= s <= max(c, p)
+
+    def test_identical_input_returns_same(self):
+        """When current == previous, result should equal both."""
+        bbox = [50, 60, 150, 160]
+        result = smooth_bbox(bbox, bbox, alpha=0.7)
+        assert result == bbox
+
+    def test_returns_integers(self):
+        """Output should always be integers."""
+        current = [11, 22, 33, 44]
+        previous = [10, 20, 30, 40]
+        result = smooth_bbox(current, previous, alpha=0.6)
+        for val in result:
+            assert isinstance(val, int)
+
+    def test_alpha_zero_raises(self):
+        """alpha=0 is invalid (would always return previous)."""
+        with pytest.raises(ValueError, match="alpha must be in"):
+            smooth_bbox([0, 0, 10, 10], [0, 0, 10, 10], alpha=0.0)
+
+    def test_alpha_negative_raises(self):
+        """Negative alpha is invalid."""
+        with pytest.raises(ValueError, match="alpha must be in"):
+            smooth_bbox([0, 0, 10, 10], [0, 0, 10, 10], alpha=-0.5)
+
+    def test_alpha_above_one_raises(self):
+        """alpha > 1 is invalid."""
+        with pytest.raises(ValueError, match="alpha must be in"):
+            smooth_bbox([0, 0, 10, 10], [0, 0, 10, 10], alpha=1.5)
+
+    def test_wrong_length_raises(self):
+        """Non-4-element lists should raise ValueError."""
+        with pytest.raises(ValueError, match="4 elements"):
+            smooth_bbox([0, 0, 10], [0, 0, 10, 10], alpha=0.7)
+
+
+# ---------------------------------------------------------------------------
+# Tests: normalize_variance
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeVariance:
+
+    def test_within_calibration_range(self):
+        """Values between p5 and p95 should map to (0, 1)."""
+        variance = np.array([0.5, 1.0, 1.5])
+        stats = {"p5": 0.0, "p95": 2.0}
+        result = normalize_variance(variance, stats)
+        np.testing.assert_allclose(result, [0.25, 0.5, 0.75])
+
+    def test_at_boundaries(self):
+        """p5 maps to 0, p95 maps to 1."""
+        variance = np.array([0.5, 2.5])
+        stats = {"p5": 0.5, "p95": 2.5}
+        result = normalize_variance(variance, stats)
+        np.testing.assert_allclose(result, [0.0, 1.0])
+
+    def test_below_p5_clips_to_zero(self):
+        """Values below p5 should be clipped to 0."""
+        variance = np.array([-1.0, 0.0])
+        stats = {"p5": 0.5, "p95": 2.5}
+        result = normalize_variance(variance, stats)
+        np.testing.assert_allclose(result, [0.0, 0.0])
+
+    def test_above_p95_clips_to_one(self):
+        """Values above p95 should be clipped to 1."""
+        variance = np.array([5.0, 100.0])
+        stats = {"p5": 0.5, "p95": 2.5}
+        result = normalize_variance(variance, stats)
+        np.testing.assert_allclose(result, [1.0, 1.0])
+
+    def test_scalar_input(self):
+        """Should work with 0-d arrays."""
+        variance = np.float64(1.5)
+        stats = {"p5": 1.0, "p95": 2.0}
+        result = normalize_variance(variance, stats)
+        assert float(result) == pytest.approx(0.5)
+
+    def test_2d_input_preserves_shape(self):
+        """Should preserve input shape (e.g., per-keypoint per-frame)."""
+        variance = np.array([[0.5, 1.0], [1.5, 2.0]])
+        stats = {"p5": 0.0, "p95": 2.0}
+        result = normalize_variance(variance, stats)
+        assert result.shape == (2, 2)
+        np.testing.assert_allclose(result, [[0.25, 0.5], [0.75, 1.0]])
+
+    def test_p95_equals_p5_raises(self):
+        """p95 == p5 would cause division by zero."""
+        variance = np.array([1.0])
+        with pytest.raises(ValueError, match="p95 must be > p5"):
+            normalize_variance(variance, {"p5": 1.0, "p95": 1.0})
+
+    def test_p95_less_than_p5_raises(self):
+        """Inverted range should raise ValueError."""
+        variance = np.array([1.0])
+        with pytest.raises(ValueError, match="p95 must be > p5"):
+            normalize_variance(variance, {"p5": 2.0, "p95": 1.0})
+
+    def test_nan_calibration_raises(self):
+        """NaN in calibration stats should raise ValueError."""
+        variance = np.array([1.0])
+        with pytest.raises(ValueError, match="must be finite"):
+            normalize_variance(variance, {"p5": float("nan"), "p95": 1.0})
+
+    def test_inf_calibration_raises(self):
+        """Inf in calibration stats should raise ValueError."""
+        variance = np.array([1.0])
+        with pytest.raises(ValueError, match="must be finite"):
+            normalize_variance(variance, {"p5": 0.0, "p95": float("inf")})
+
+    def test_degenerate_range_raises(self):
+        """Extremely narrow calibration range should raise ValueError."""
+        variance = np.array([1.0])
+        with pytest.raises(ValueError, match="too narrow"):
+            normalize_variance(variance, {"p5": 1.0, "p95": 1.0 + 1e-8})

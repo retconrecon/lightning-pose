@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "sam_masks_to_lp_bbox",
     "lp_keypoints_to_sam_bbox",
+    "smooth_bbox",
+    "normalize_variance",
     "apply_mask_to_images",
     "crop_frames_for_labeling",
     "prepare_animal_dataset",
@@ -242,6 +244,8 @@ def lp_keypoints_to_sam_bbox(
     padding_ratio: float = 0.25,
     confidence_threshold: float = 0.3,
     min_confident_keypoints: int = 2,
+    frame_dims: tuple[int, int] | None = None,
+    min_bbox_size: int = 0,
 ) -> list[int] | None:
     """Convert LP keypoints to a SAM/SAMURAI-compatible [x1, y1, x2, y2] bbox.
 
@@ -276,15 +280,31 @@ def lp_keypoints_to_sam_bbox(
         confidence_threshold: Minimum confidence for a keypoint to be included.
         min_confident_keypoints: Minimum number of confident keypoints required
             to produce a bbox. Returns None if fewer pass the threshold.
+        frame_dims: Optional (width, height) of the source frame. When provided,
+            the output bbox is clamped to ``[0, 0, width, height]`` so coordinates
+            never go negative or exceed frame boundaries.
+        min_bbox_size: Minimum width and height (in pixels) of the output bbox.
+            If the bbox is smaller than this in either dimension, it is expanded
+            symmetrically around its center. Prevents tiny crops that amplify
+            noise through ``cv2.resize``. Default 0 (no minimum).
 
     Returns:
         [x1, y1, x2, y2] integer bbox, or None if too few confident keypoints.
-        Note: padding near frame edges can produce negative x1/y1 values.
-        Consumers (SAM/SAMURAI) may need to clamp to frame boundaries.
 
     """
+    if keypoints.ndim != 2 or keypoints.shape[1] != 2:
+        raise ValueError(
+            f"keypoints must be (N, 2), got shape {keypoints.shape}"
+        )
+    if confidence.ndim != 1 or len(confidence) != len(keypoints):
+        raise ValueError(
+            f"confidence must be 1D with len matching keypoints "
+            f"({len(keypoints)}), got shape {confidence.shape}"
+        )
     if padding_ratio < 0:
         raise ValueError(f"padding_ratio must be >= 0, got {padding_ratio}")
+    if min_bbox_size < 0:
+        raise ValueError(f"min_bbox_size must be >= 0, got {min_bbox_size}")
 
     # Filter NaN keypoints before confidence check (AXIOM-5).
     # NaN coordinates would pass confidence filter and crash int().
@@ -308,7 +328,109 @@ def lp_keypoints_to_sam_bbox(
     x2 = int(x_max + pad_x)
     y2 = int(y_max + pad_y)
 
+    # Enforce minimum bbox size by expanding symmetrically around center.
+    if min_bbox_size > 0:
+        bw = x2 - x1
+        bh = y2 - y1
+        if bw < min_bbox_size:
+            deficit = min_bbox_size - bw
+            x1 -= deficit // 2
+            x2 += (deficit + 1) // 2  # ceil for odd deficit
+        if bh < min_bbox_size:
+            deficit = min_bbox_size - bh
+            y1 -= deficit // 2
+            y2 += (deficit + 1) // 2
+
+    # Clamp to frame boundaries.
+    if frame_dims is not None:
+        fw, fh = frame_dims
+        if fw <= 0 or fh <= 0:
+            raise ValueError(f"frame_dims must be positive, got {frame_dims}")
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(fw, x2)
+        y2 = min(fh, y2)
+
     return [x1, y1, x2, y2]
+
+
+@typechecked
+def smooth_bbox(
+    current: list[int],
+    previous: list[int],
+    alpha: float = 0.7,
+) -> list[int]:
+    """Exponential moving average of bbox coordinates across frames.
+
+    Prevents jitter in the predict -> bbox -> crop -> predict feedback loop
+    by smoothing bbox transitions. Higher ``alpha`` weights the current frame
+    more heavily (less smoothing).
+
+    Args:
+        current: Current frame's ``[x1, y1, x2, y2]`` bbox.
+        previous: Previous frame's ``[x1, y1, x2, y2]`` bbox.
+        alpha: Weight for the current bbox. Must be in ``(0, 1]``.
+            1.0 means no smoothing (return current as-is).
+            0.5 means equal weight to current and previous.
+
+    Returns:
+        Smoothed ``[x1, y1, x2, y2]`` integer bbox.
+
+    """
+    if not (0.0 < alpha <= 1.0):
+        raise ValueError(f"alpha must be in (0, 1], got {alpha}")
+    if len(current) != 4 or len(previous) != 4:
+        raise ValueError(
+            f"current and previous must each have 4 elements, "
+            f"got {len(current)} and {len(previous)}"
+        )
+    return [
+        int(round(alpha * c + (1.0 - alpha) * p))
+        for c, p in zip(current, previous)
+    ]
+
+
+@typechecked
+def normalize_variance(
+    variance: np.ndarray,
+    calibration_stats: dict,
+) -> np.ndarray:
+    """Normalize per-frame variance to [0, 1] using calibration statistics.
+
+    Makes variance thresholds portable across models and datasets by scaling
+    raw variance (which depends on image resolution, model architecture, and
+    ensemble size) to a consistent range.
+
+    Uses percentile-based normalization: values at or below ``p5`` map to 0,
+    values at or above ``p95`` map to 1, with linear interpolation between.
+    Output is clipped to [0, 1].
+
+    Collect calibration stats by running the ensemble on ~1000 "normal
+    tracking" frames and recording ``np.percentile(variances, [5, 95])``.
+
+    Args:
+        variance: Per-keypoint or per-frame variance array (any shape).
+            Units are px^2 from ``EnsemblePredictor.predict_frame``.
+        calibration_stats: Must contain ``"p5"`` and ``"p95"`` keys with
+            float values. ``p95`` must be strictly greater than ``p5``.
+
+    Returns:
+        Array of same shape as ``variance`` with values in [0, 1].
+
+    """
+    p5 = calibration_stats["p5"]
+    p95 = calibration_stats["p95"]
+    if not (np.isfinite(p5) and np.isfinite(p95)):
+        raise ValueError(f"p5 and p95 must be finite, got p5={p5}, p95={p95}")
+    if p95 <= p5:
+        raise ValueError(f"p95 must be > p5, got p5={p5}, p95={p95}")
+    if (p95 - p5) < 1e-6:
+        raise ValueError(
+            f"calibration range too narrow (p95 - p5 = {p95 - p5:.2e}), "
+            f"variance distribution may be degenerate"
+        )
+    normalized = (variance - p5) / (p95 - p5)
+    return np.clip(normalized, 0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
