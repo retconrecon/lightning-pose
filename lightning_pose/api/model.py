@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +24,8 @@ from lightning_pose.utils.scripts import (
     get_dataset,
     get_imgaug_transform,
 )
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["Model", "EnsemblePredictor"]
 
@@ -612,6 +615,10 @@ class EnsemblePredictor:
             # Clean up any models already loaded on GPU
             self.models.clear()
             raise
+        logger.info(
+            f"EnsemblePredictor loaded {len(self.models)} models from "
+            f"{[str(d) for d in model_dirs]}"
+        )
 
     def predict_frame(
         self,
@@ -638,10 +645,19 @@ class EnsemblePredictor:
         all_kps = np.stack([r["keypoints"] for r in results])    # (N, K, 2)
         all_conf = np.stack([r["confidence"] for r in results])  # (N, K)
 
+        variance = all_kps.var(axis=0).sum(axis=-1)              # (K,)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"EnsemblePredictor: n_models={len(self.models)}, "
+                f"mean_var={variance.mean():.4f}, max_var={variance.max():.4f}, "
+                f"kp_spread={all_kps.max(axis=0).mean() - all_kps.min(axis=0).mean():.4f}"
+            )
+
         return {
             "keypoints": all_kps.mean(axis=0),                   # (K, 2)
             "confidence": all_conf.mean(axis=0),                  # (K,)
-            "variance": all_kps.var(axis=0).sum(axis=-1),         # (K,)
+            "variance": variance,
             "per_model": results,
         }
 
