@@ -35,6 +35,7 @@ __all__ = [
     "lp_keypoints_to_sam_bbox",
     "smooth_bbox",
     "normalize_variance",
+    "detect_swap_events",
     "apply_mask_to_images",
     "crop_frames_for_labeling",
     "prepare_animal_dataset",
@@ -431,6 +432,141 @@ def normalize_variance(
         )
     normalized = (variance - p5) / (p95 - p5)
     return np.clip(normalized, 0.0, 1.0)
+
+
+@typechecked
+def detect_swap_events(
+    trajectories_a: np.ndarray,
+    trajectories_b: np.ndarray,
+    min_swap_fraction: float = 0.5,
+    temporal_window: int = 5,
+) -> list[dict[str, int | float]]:
+    """Detect identity swap events from keypoint trajectory crossings.
+
+    When two tracked animals cross paths, SAM2/SAMURAI often swaps their
+    identities. This manifests as simultaneous sign flips in the relative
+    position (A - B) across multiple bodyparts. A frame where a large fraction
+    of bodyparts flip sign is likely a swap.
+
+    Algorithm:
+        1. Compute ``diff = trajectories_a - trajectories_b`` per frame.
+        2. For each bodypart, detect frames where the sign of diff flips
+           in either x or y (a "crossing").
+        3. Flag frames where the fraction of crossing bodyparts >= threshold.
+        4. Merge flagged frames within ``temporal_window`` into single events.
+
+    Args:
+        trajectories_a: (T, K, 2) keypoints for animal A across T frames,
+            K bodyparts, 2 coordinates (x, y). NaN indicates missing data.
+        trajectories_b: (T, K, 2) keypoints for animal B. Must match shape.
+        min_swap_fraction: Fraction of bodyparts that must cross simultaneously
+            to flag a swap. Must be in (0, 1].
+        temporal_window: Consecutive flagged frames within this many frames
+            of each other are merged into a single event. Must be >= 1.
+
+    Returns:
+        List of swap event dicts, each containing:
+            - ``"frame"``: int — frame index (center of the crossing cluster)
+            - ``"n_crossed"``: int — number of bodyparts that crossed
+            - ``"n_valid"``: int — total non-NaN bodyparts at that frame
+            - ``"fraction"``: float — n_crossed / n_valid
+
+    """
+    # --- Input validation ---
+    if trajectories_a.ndim != 3 or trajectories_a.shape[2] != 2:
+        raise ValueError(
+            f"trajectories_a must be (T, K, 2), got {trajectories_a.shape}"
+        )
+    if trajectories_a.shape != trajectories_b.shape:
+        raise ValueError(
+            f"Shape mismatch: trajectories_a {trajectories_a.shape} "
+            f"!= trajectories_b {trajectories_b.shape}"
+        )
+    if trajectories_a.shape[0] < 2:
+        raise ValueError(
+            f"Need >= 2 frames, got {trajectories_a.shape[0]}"
+        )
+    if not (0.0 < min_swap_fraction <= 1.0):
+        raise ValueError(
+            f"min_swap_fraction must be in (0, 1], got {min_swap_fraction}"
+        )
+    if temporal_window < 1:
+        raise ValueError(
+            f"temporal_window must be >= 1, got {temporal_window}"
+        )
+
+    T, K, _ = trajectories_a.shape
+
+    # --- Compute sign of relative position ---
+    diff = trajectories_a - trajectories_b  # (T, K, 2)
+
+    # --- Detect per-bodypart crossings ---
+    # A crossing at frame t means sign(diff[t]) != sign(diff[t-1]) for x or y.
+    # np.sign maps negative→-1, zero→0, positive→+1.
+    signs = np.sign(diff)  # (T, K, 2)
+
+    # Identify valid (non-NaN) frames per bodypart: both animals must be finite
+    valid_a = np.isfinite(trajectories_a).all(axis=2)  # (T, K)
+    valid_b = np.isfinite(trajectories_b).all(axis=2)  # (T, K)
+    valid = valid_a & valid_b  # (T, K)
+
+    # Sign flip between consecutive frames for each coordinate
+    sign_change = signs[1:] != signs[:-1]  # (T-1, K, 2)
+
+    # A bodypart "crosses" if either x or y flips sign
+    crossing_per_bp = sign_change.any(axis=2)  # (T-1, K)
+
+    # Both current and previous frame must be valid for this bodypart
+    both_valid = valid[1:] & valid[:-1]  # (T-1, K)
+
+    # Only count crossings where both frames are valid
+    crossing_per_bp = crossing_per_bp & both_valid  # (T-1, K)
+
+    # --- Count crossings per frame and threshold ---
+    flagged_frames = []  # list of (frame_index, n_crossed, n_valid, fraction)
+
+    for t in range(T - 1):
+        n_valid = both_valid[t].sum()
+        if n_valid == 0:
+            continue
+        n_crossed = crossing_per_bp[t].sum()
+        fraction = n_crossed / n_valid
+        if fraction >= min_swap_fraction:
+            # Report as frame t+1 (the frame where the new sign appears)
+            flagged_frames.append((t + 1, int(n_crossed), int(n_valid), float(fraction)))
+
+    if not flagged_frames:
+        return []
+
+    # --- Merge within temporal_window ---
+    events: list[dict[str, int | float]] = []
+    current_cluster: list[tuple[int, int, int, float]] = [flagged_frames[0]]
+
+    for entry in flagged_frames[1:]:
+        if entry[0] - current_cluster[-1][0] <= temporal_window:
+            current_cluster.append(entry)
+        else:
+            # Emit event for completed cluster
+            events.append(_cluster_to_event(current_cluster))
+            current_cluster = [entry]
+
+    # Emit final cluster
+    events.append(_cluster_to_event(current_cluster))
+
+    return events
+
+
+def _cluster_to_event(
+    cluster: list[tuple[int, int, int, float]],
+) -> dict[str, int | float]:
+    """Pick the frame with the highest fraction as the event center."""
+    best = max(cluster, key=lambda x: x[3])
+    return {
+        "frame": best[0],
+        "n_crossed": best[1],
+        "n_valid": best[2],
+        "fraction": best[3],
+    }
 
 
 # ---------------------------------------------------------------------------
