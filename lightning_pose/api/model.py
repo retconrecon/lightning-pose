@@ -3,13 +3,18 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pandas as pd
+import torch
 from omegaconf import DictConfig, OmegaConf
 
 from lightning_pose.api.model_config import ModelConfig
+from lightning_pose.data import _IMAGENET_MEAN, _IMAGENET_STD
 from lightning_pose.data.datatypes import MultiviewPredictionResult, PredictionResult
+from lightning_pose.data.utils import convert_bbox_coords
 from lightning_pose.models import ALLOWED_MODELS
+from lightning_pose.models.heatmap_tracker_mhcrnn import HeatmapTrackerMHCRNN
 from lightning_pose.utils import io as io_utils
 from lightning_pose.utils.predictions import generate_labeled_video as generate_labeled_video_fn
 from lightning_pose.utils.predictions import (
@@ -129,12 +134,10 @@ class Model:
         differences. Do not mix results from the two paths in quantitative
         analysis.
 
-        For MHCRNN (context) models, the single frame is replicated to fill
-        the 5-frame temporal window. Divergence from ``predict_on_video_file``
-        may be substantially larger than for standard models because the
-        temporal context is synthetic. The sf/mf confidence merge mitigates
-        the degenerate zero-motion context -- if the mf head is uncertain,
-        the sf prediction is kept.
+        For MHCRNN (context) models, pass a ``(T, H, W, 3)`` array where T
+        is the temporal context length (typically 5). Passing a single frame
+        to a context model raises ``ValueError`` — use
+        ``predict_on_video_file`` for proper temporal inference.
 
         The first call triggers model loading and CUDA initialization, which
         may take several seconds. Subsequent calls are fast (~5-50ms depending
@@ -142,8 +145,9 @@ class Model:
         before entering the loop.
 
         Args:
-            frame_rgb: (H, W, 3) uint8 RGB array in original frame coordinates.
-            bbox: Optional (x, y, w, h) crop region. Note: this is
+            frame_rgb: ``(H, W, 3)`` uint8 RGB array for standard models, or
+                ``(T, H, W, 3)`` uint8 RGB array for context (MHCRNN) models.
+            bbox: Optional ``(x, y, w, h)`` crop region. Note: this is
                 ``(x, y, width, height)``, NOT ``(x1, y1, x2, y2)``.
                 If provided, crops first, then remaps keypoints back to
                 original coordinates.
@@ -151,29 +155,16 @@ class Model:
         Returns:
             {"keypoints": (num_kp, 2) float32 array (x, y) in original frame coords,
              "confidence": (num_kp,) float32 in [0, 1] -- softmax peak intensity
-              per keypoint, not a calibrated probability}
+              per keypoint, not a calibrated probability.
+              For regression models, confidence is always 1.0.}
 
         Raises:
             ValueError: If frame_rgb has wrong shape/dtype, bbox has non-positive
-                dimensions, or bbox produces an empty crop.
-            NotImplementedError: If the model is not a heatmap-based model
-                (e.g., regression models are not supported).
+                dimensions, bbox produces an empty crop, or a context model
+                receives single-frame input.
 
         """
-        import cv2
-        import torch
-        from lightning_pose.data import _IMAGENET_MEAN, _IMAGENET_STD
-        from lightning_pose.models.heatmap_tracker_mhcrnn import HeatmapTrackerMHCRNN
-
         self._load()
-
-        # Guard: only heatmap-based models expose run_subpixelmaxima
-        if not hasattr(self.model, 'head') or \
-                not hasattr(self.model.head, 'run_subpixelmaxima'):
-            raise NotImplementedError(
-                f"predict_frame() requires a heatmap-based model, "
-                f"got {type(self.model).__name__}"
-            )
 
         # --- Input validation ---
         if frame_rgb.dtype != np.uint8:
@@ -181,14 +172,36 @@ class Model:
                 f"frame_rgb must be uint8, got {frame_rgb.dtype}. "
                 "Convert with frame.astype(np.uint8) if values are in [0, 255]."
             )
-        if frame_rgb.ndim != 3 or frame_rgb.shape[2] != 3:
+
+        is_context_input = frame_rgb.ndim == 4
+        if is_context_input:
+            if frame_rgb.shape[3] != 3:
+                raise ValueError(
+                    f"frame_rgb must be (T, H, W, 3), got shape {frame_rgb.shape}"
+                )
+        elif frame_rgb.ndim == 3:
+            if frame_rgb.shape[2] != 3:
+                raise ValueError(
+                    f"frame_rgb must be (H, W, 3), got shape {frame_rgb.shape}"
+                )
+        else:
             raise ValueError(
-                f"frame_rgb must be (H, W, 3), got shape {frame_rgb.shape}"
+                f"frame_rgb must be (H, W, 3) or (T, H, W, 3), "
+                f"got {frame_rgb.ndim}D array with shape {frame_rgb.shape}"
             )
+
         if frame_rgb.size == 0:
             raise ValueError("frame_rgb is empty")
 
-        # --- Preprocessing ---
+        is_mhcrnn = isinstance(self.model, HeatmapTrackerMHCRNN)
+        if is_mhcrnn and not is_context_input:
+            raise ValueError(
+                "Context (MHCRNN) model requires frame_rgb of shape (T, H, W, 3) "
+                "where T is the temporal context length (typically 5). "
+                "Use predict_on_video_file for single-frame input."
+            )
+
+        # --- Crop ---
         if bbox is not None:
             bx, by, bw, bh = bbox
             if bx < 0 or by < 0:
@@ -199,85 +212,107 @@ class Model:
                 raise ValueError(
                     f"bbox width and height must be positive, got w={bw}, h={bh}"
                 )
-            crop = frame_rgb[by:by + bh, bx:bx + bw]
+            if is_context_input:
+                crop = frame_rgb[:, by:by + bh, bx:bx + bw]
+            else:
+                crop = frame_rgb[by:by + bh, bx:bx + bw]
             if crop.size == 0:
                 raise ValueError(
                     f"bbox (x={bx}, y={by}, w={bw}, h={bh}) produces an empty "
-                    f"crop on frame of shape {frame_rgb.shape[:2]}"
+                    f"crop on frame of shape {frame_rgb.shape}"
                 )
             # Use actual crop dims for remap -- numpy clips silently when
             # bbox extends beyond frame boundaries.
-            actual_h, actual_w = crop.shape[:2]
+            if is_context_input:
+                actual_h, actual_w = crop.shape[1], crop.shape[2]
+            else:
+                actual_h, actual_w = crop.shape[0], crop.shape[1]
         else:
             crop = frame_rgb
 
+        # --- Preprocess ---
         resize_h = self.cfg.data.image_resize_dims.height
         resize_w = self.cfg.data.image_resize_dims.width
-        resized = cv2.resize(crop, (resize_w, resize_h), interpolation=cv2.INTER_LINEAR)
-
-        # Normalize: /255, subtract mean, divide std (ImageNet)
-        tensor = resized.astype(np.float32) / 255.0
         mean = np.array(_IMAGENET_MEAN, dtype=np.float32)
         std = np.array(_IMAGENET_STD, dtype=np.float32)
-        tensor = (tensor - mean) / std
 
-        # HWC -> CHW, add batch dim
-        tensor = np.transpose(tensor, (2, 0, 1))  # (3, H, W)
+        def _preprocess_single(img):
+            resized = cv2.resize(
+                img, (resize_w, resize_h), interpolation=cv2.INTER_LINEAR,
+            )
+            t = resized.astype(np.float32) / 255.0
+            t = (t - mean) / std
+            return np.transpose(t, (2, 0, 1))  # (3, H, W)
 
-        device = next(self.model.parameters()).device
-        # TODO: push dispatch into model classes (predict_single_frame on base)
-        is_context = isinstance(self.model, HeatmapTrackerMHCRNN)
-
-        # Ensure eval mode (batch norm stats should not drift)
-        self.model.eval()
-
-        if is_context:
-            # MHCRNN expects (seq_len, 3, H, W) -- replicate frame to 5-frame sequence.
-            # Shape is (5, 3, H, W) not (1, 5, 3, H, W) so it enters
-            # get_representations() via the 4D branch (DALI unlabeled-sequence path).
-            # With all-identical frames, boundary padding is indistinguishable from
-            # non-padding, so get_context_from_sequence produces a valid context window.
-            tensor_t = torch.from_numpy(tensor).unsqueeze(0).expand(5, -1, -1, -1)
-            tensor_t = tensor_t.to(device)
+        if is_context_input:
+            frames = [_preprocess_single(crop[i]) for i in range(crop.shape[0])]
+            tensor = np.stack(frames)  # (T, 3, H, W)
+            tensor_t = torch.from_numpy(tensor).unsqueeze(0)  # (1, T, 3, H, W)
         else:
-            tensor_t = torch.from_numpy(tensor).unsqueeze(0).to(device)  # (1, 3, H, W)
+            tensor = _preprocess_single(crop)
+            tensor_t = torch.from_numpy(tensor).unsqueeze(0)  # (1, 3, H, W)
 
-        # --- Inference ---
-        with torch.inference_mode():
-            if is_context:
-                heatmaps_sf, heatmaps_mf = self.model(tensor_t)
-                kp_sf, conf_sf = self.model.head.run_subpixelmaxima(heatmaps_sf)
-                kp_mf, conf_mf = self.model.head.run_subpixelmaxima(heatmaps_mf)
-                # Select higher-confidence predictions per keypoint
-                kp_sf = kp_sf.reshape(kp_sf.shape[0], -1, 2)
-                kp_mf = kp_mf.reshape(kp_mf.shape[0], -1, 2)
-                mf_better = torch.gt(conf_mf, conf_sf)
-                kp_sf[mf_better] = kp_mf[mf_better]
-                keypoints = kp_sf.reshape(kp_sf.shape[0], -1)
-                confidence = conf_sf.clone()
-                confidence[mf_better] = conf_mf[mf_better]
-            else:
-                heatmaps = self.model(tensor_t)
-                keypoints, confidence = self.model.head.run_subpixelmaxima(heatmaps)
+        device = self.model.device
+        tensor_t = tensor_t.to(device)
 
-        # --- Coordinate remap ---
-        # keypoints shape: (1, num_kp * 2) flattened [x1, y1, x2, y2, ...]
-        kp = keypoints[0].cpu().numpy().reshape(-1, 2).astype(np.float32)
-        conf = confidence[0].cpu().numpy().astype(np.float32)
-
-        # Normalize to [0, 1]
-        kp[:, 0] /= resize_w
-        kp[:, 1] /= resize_h
-
-        # Scale to crop/frame dimensions.
-        # When bbox is provided, use actual_w/actual_h (not requested bw/bh)
-        # because numpy clips silently when bbox extends beyond frame edges.
+        # --- Build batch dict ---
+        # Bbox in LP format: [x, y, height, width]
         if bbox is not None:
-            kp[:, 0] = kp[:, 0] * actual_w + bx
-            kp[:, 1] = kp[:, 1] * actual_h + by
+            bbox_lp = torch.tensor(
+                [[bx, by, actual_h, actual_w]], dtype=torch.float32, device=device,
+            )
         else:
-            kp[:, 0] *= frame_rgb.shape[1]  # width
-            kp[:, 1] *= frame_rgb.shape[0]  # height
+            if is_context_input:
+                fh, fw = frame_rgb.shape[1], frame_rgb.shape[2]
+            else:
+                fh, fw = frame_rgb.shape[0], frame_rgb.shape[1]
+            bbox_lp = torch.tensor(
+                [[0, 0, fh, fw]], dtype=torch.float32, device=device,
+            )
+
+        num_kp = self.model.num_keypoints
+        batch_dict = {
+            "images": tensor_t,
+            "keypoints": torch.zeros(1, num_kp * 2, dtype=torch.float32, device=device),
+            "bbox": bbox_lp,
+            "idxs": torch.zeros(1, dtype=torch.long, device=device),
+            "heatmaps": torch.zeros(1, num_kp, 1, 1, dtype=torch.float32, device=device),
+        }
+
+        # --- Inference via get_loss_inputs_labeled ---
+        self.model.eval()
+        with torch.inference_mode():
+            result = self.model.get_loss_inputs_labeled(batch_dict)
+
+        # --- Extract predictions ---
+        kp_pred = result["keypoints_pred"]
+        has_confidence = "confidences" in result
+
+        if is_mhcrnn:
+            # MHCRNN get_loss_inputs_labeled concatenates [sf; mf] along batch dim
+            n = kp_pred.shape[0] // 2
+            kp_sf = kp_pred[:n].reshape(n, -1, 2)
+            kp_mf = kp_pred[n:].reshape(n, -1, 2)
+            conf_sf = result["confidences"][:n]
+            conf_mf = result["confidences"][n:]
+            # Merge: pick higher-confidence prediction per keypoint
+            mf_better = conf_mf > conf_sf
+            kp_sf[mf_better] = kp_mf[mf_better]
+            conf_merged = conf_sf.clone()
+            conf_merged[mf_better] = conf_mf[mf_better]
+            kp = kp_sf[0].cpu().numpy().astype(np.float32)
+            conf = conf_merged[0].cpu().numpy().astype(np.float32)
+        elif has_confidence:
+            # Heatmap model — keypoints already in original frame coords
+            # (get_loss_inputs_labeled calls convert_bbox_coords internally)
+            kp = kp_pred[0].cpu().numpy().reshape(-1, 2).astype(np.float32)
+            conf = result["confidences"][0].cpu().numpy().astype(np.float32)
+        else:
+            # Regression model — get_loss_inputs_labeled does not call
+            # convert_bbox_coords, so we apply the remap ourselves.
+            kp_pred = convert_bbox_coords(batch_dict, kp_pred, in_place=False)
+            kp = kp_pred[0].cpu().numpy().reshape(-1, 2).astype(np.float32)
+            conf = np.ones(num_kp, dtype=np.float32)
 
         return {"keypoints": kp, "confidence": conf}
 
